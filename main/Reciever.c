@@ -5,18 +5,54 @@
 #include "esp_event.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
+#include "driver/ledc.h"
 
 #define BUZZER_GPIO GPIO_NUM_27
+#define BUZZER_CHANNEL LEDC_CHANNEL_0
+#define BUZZER_TIMER   LEDC_TIMER_0
 
+static bool alarm_active = false;
+
+// ESP-NOW receive callback
 void recv_cb(const uint8_t *mac_addr, const uint8_t *data, int len) {
     printf("Received: %.*s\n", len, data);
 
     if (strncmp((char*)data, "PANIC", len) == 0) {
-        for (int i = 0; i < 5; i++) {
-            gpio_set_level(BUZZER_GPIO, 1);
-            vTaskDelay(pdMS_TO_TICKS(300));
-            gpio_set_level(BUZZER_GPIO, 0);
-            vTaskDelay(pdMS_TO_TICKS(300));
+        alarm_active = true;
+        printf("Alarm armed\n");
+    } else if (strncmp((char*)data, "DISARM", len) == 0) {
+        alarm_active = false;
+        // silence immediately
+        ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 0);
+        ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
+        printf("System disarmed\n");
+    }
+}
+
+// Sawtooth alarm task
+void alarm_task(void *pvParameter) {
+    while (1) {
+        if (alarm_active) {
+            // ramp up duty gradually
+            for (int duty = 0; duty <= 1023 && alarm_active; duty += 50) {
+                ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, duty);
+                ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
+                vTaskDelay(pdMS_TO_TICKS(40)); // controls ramp speed
+            }
+
+            // stay at max volume for a while
+            if (alarm_active) {
+                ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 1023);
+                ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
+                vTaskDelay(pdMS_TO_TICKS(600)); // hold max ~0.6s
+            }
+
+            // drop to silence before repeating
+            ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 0);
+            ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
+            vTaskDelay(pdMS_TO_TICKS(400)); // pause at silence
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(200)); // idle
         }
     }
 }
@@ -51,6 +87,27 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_now_init());
     esp_now_register_recv_cb(recv_cb);
 
-    // Configure buzzer
-    gpio_set_direction(BUZZER_GPIO, GPIO_MODE_OUTPUT);
+    // Configure buzzer PWM
+    ledc_timer_config_t timer_conf = {
+        .speed_mode       = LEDC_HIGH_SPEED_MODE,
+        .duty_resolution  = LEDC_TIMER_10_BIT, // 0–1023
+        .timer_num        = BUZZER_TIMER,
+        .freq_hz          = 2000,              // tone frequency
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
+
+    ledc_channel_config_t channel_conf = {
+        .gpio_num       = BUZZER_GPIO,
+        .speed_mode     = LEDC_HIGH_SPEED_MODE,
+        .channel        = BUZZER_CHANNEL,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .timer_sel      = BUZZER_TIMER,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&channel_conf));
+
+    // Start alarm task
+    xTaskCreate(alarm_task, "alarm_task", 2048, NULL, 5, NULL);
 }
