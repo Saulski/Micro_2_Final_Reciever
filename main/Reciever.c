@@ -6,78 +6,123 @@
 #include "nvs_flash.h"
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #define BUZZER_GPIO    GPIO_NUM_27
 #define BUZZER_CHANNEL LEDC_CHANNEL_0
 #define BUZZER_TIMER   LEDC_TIMER_0
 
 #define LED_GPIO       GPIO_NUM_26   // Red LED indicator
+#define SERVO_GPIO     GPIO_NUM_18   // FS90R continuous servo
 
 // Door/trunk buttons (external pull-downs)
 #define DOOR1_GPIO GPIO_NUM_32
 #define DOOR2_GPIO GPIO_NUM_33
 #define TRUNK_GPIO GPIO_NUM_25
 
+// Tuned neutral pulse width to prevent creep
+#define SERVO_NEUTRAL 1492
+
 static bool alarm_active = false;
 static bool armed_state = false;
+static bool window_down = false; // false = up, true = down
 
-// ESP-NOW receive callback
-void recv_cb(const uint8_t *mac_addr, const uint8_t *data, int len) {
+// --- Servo helpers (continuous rotation FS90R) ---
+static inline int us_to_duty(int us) {
+    // LEDC 13-bit resolution (0..8191), 20ms period (50 Hz)
+    return (us * 8191) / 20000;
+}
+
+static inline void servo_set_us(int us) {
+    ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, us_to_duty(us));
+    ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1);
+}
+
+// --- ESP-NOW receive callback (ESP-IDF v5.x signature) ---
+void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     printf("Received: %.*s\n", len, data);
 
-    // Read raw states (0 = closed, 1 = open with external pull-downs)
     int door1 = gpio_get_level(DOOR1_GPIO);
     int door2 = gpio_get_level(DOOR2_GPIO);
     int trunk = gpio_get_level(TRUNK_GPIO);
 
-    printf("Door1=%d Door2=%d Trunk=%d\n", door1, door2, trunk);
-
     if (strncmp((char*)data, "PANIC", len) == 0) {
         alarm_active = true;
-        gpio_set_level(LED_GPIO, 1); // LED ON during panic
+        gpio_set_level(LED_GPIO, 1);
         printf("Panic alarm triggered\n");
 
     } else if (strncmp((char*)data, "DISARM", len) == 0) {
         alarm_active = false;
         armed_state = false;
-        gpio_set_level(LED_GPIO, 0); // LED OFF
+        gpio_set_level(LED_GPIO, 0);
         ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 0);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
         printf("System disarmed\n");
 
     } else if (strncmp((char*)data, "ARM", len) == 0) {
-        if (door1 == 0 && door2 == 0 && trunk == 0) {
+        if (door1 == 0 && door2 == 0 && trunk == 0 && !window_down) {
             armed_state = true;
-            gpio_set_level(LED_GPIO, 1); // LED ON
+            gpio_set_level(LED_GPIO, 1);
             printf("System armed successfully\n");
 
-            // One loud beep at max volume
+            // One loud beep
             ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 1023);
             ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
-            vTaskDelay(pdMS_TO_TICKS(300)); // beep duration
+            vTaskDelay(pdMS_TO_TICKS(300));
             ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 0);
             ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
 
         } else {
             armed_state = false;
-            gpio_set_level(LED_GPIO, 0); // LED stays OFF
-            printf("Arming failed — entry open\n");
-
-            // 3 short, fast beeps at max volume
-            for (int i = 0; i < 3; i++) {
-                ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 1023); // max duty
-                ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
-                vTaskDelay(pdMS_TO_TICKS(150)); // short beep
-
-                ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 0); // silence
-                ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
-                vTaskDelay(pdMS_TO_TICKS(150)); // short pause
+            gpio_set_level(LED_GPIO, 0);
+            if (window_down) {
+                printf("Arming failed — window is down\n");
+            } else {
+                printf("Arming failed — entry open\n");
             }
+
+            // 3 short beeps
+            for (int i = 0; i < 3; i++) {
+                ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 1023);
+                ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
+                vTaskDelay(pdMS_TO_TICKS(150));
+                ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 0);
+                ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
+                vTaskDelay(pdMS_TO_TICKS(150));
+            }
+        }
+
+    } else if (strncmp((char*)data, "WINDOW", len) == 0) {
+        if (!armed_state) {
+            if (!window_down) {
+                printf("Rolling window down...\n");
+                servo_set_us(1400); // forward slow
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                servo_set_us(SERVO_NEUTRAL);
+                window_down = true;
+            } else {
+                printf("Rolling window up...\n");
+                servo_set_us(1600); // reverse slow
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                servo_set_us(SERVO_NEUTRAL);
+                window_down = false;
+            }
+
+            // short beep feedback
+            ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 1023);
+            ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
+            vTaskDelay(pdMS_TO_TICKS(200));
+            ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 0);
+            ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
+
+        } else {
+            printf("Cannot roll windows while armed\n");
         }
     }
 }
 
-// Sawtooth alarm task
+// --- Sawtooth alarm task ---
 void alarm_task(void *pvParameter) {
     while (1) {
         if (alarm_active) {
@@ -120,12 +165,6 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Print back MAC
-    uint8_t mac_sta[6];
-    ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, mac_sta));
-    printf("Receiver STA MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
-           mac_sta[0], mac_sta[1], mac_sta[2], mac_sta[3], mac_sta[4], mac_sta[5]);
-
     // Init ESP-NOW
     ESP_ERROR_CHECK(esp_now_init());
     esp_now_register_recv_cb(recv_cb);
@@ -153,17 +192,39 @@ void app_main(void) {
 
     // Configure red LED
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, 0); // start OFF
+    gpio_set_level(LED_GPIO, 0);
 
-    // Configure door/trunk buttons (external pull-downs → floating in software)
+    // Configure door/trunk buttons
     gpio_set_direction(DOOR1_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(DOOR1_GPIO, GPIO_FLOATING);
-
     gpio_set_direction(DOOR2_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(DOOR2_GPIO, GPIO_FLOATING);
-
     gpio_set_direction(TRUNK_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(TRUNK_GPIO, GPIO_FLOATING);
+
+    // Configure servo PWM (LEDC, 50 Hz)
+    ledc_timer_config_t servo_timer = {
+        .speed_mode       = LEDC_HIGH_SPEED_MODE,
+        .duty_resolution  = LEDC_TIMER_13_BIT,
+        .timer_num        = LEDC_TIMER_1,
+        .freq_hz          = 50,
+        .clk_cfg          = LEDC_AUTO_CLK
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&servo_timer));
+
+    ledc_channel_config_t servo_channel = {
+        .gpio_num       = SERVO_GPIO,
+        .speed_mode     = LEDC_HIGH_SPEED_MODE,
+        .channel        = LEDC_CHANNEL_1,
+        .intr_type      = LEDC_INTR_DISABLE,
+        .timer_sel      = LEDC_TIMER_1,
+        .duty           = 0,
+        .hpoint         = 0
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&servo_channel));
+
+    // Immediately drive servo to neutral (stop at tuned value)
+    servo_set_us(SERVO_NEUTRAL);
 
     // Start alarm task
     xTaskCreate(alarm_task, "alarm_task", 2048, NULL, 5, NULL);
