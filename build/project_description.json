@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "Reciever",
-    "project_version":    "ca238bb-dirty",
+    "project_version":    "48a867e-dirty",
     "project_path":       "C:/Micro_2/Labs/Reciever/Reciever",
     "idf_path":           "C:/Espressif/v5.3.4/esp-idf",
     "build_dir":          "C:/Micro_2/Labs/Reciever/Reciever/build",
