@@ -17,22 +17,25 @@
 #define SERVO_GPIO     GPIO_NUM_18   // FS90R continuous servo
 #define BREAKIN_LED    GPIO_NUM_19   // Break-in status indicator (latched until DISARM)
 
-// Door/trunk buttons (external pull-downs, read 1 = open if wired that way; adjust if needed)
+// Door/trunk buttons (external pull-downs)
 #define DOOR1_GPIO GPIO_NUM_32
 #define DOOR2_GPIO GPIO_NUM_33
 #define TRUNK_GPIO GPIO_NUM_25
 
-        // Tuned neutral pulse width to prevent creep
-#define SERVO_NEUTRAL 1492
+// ✅ Backseat pressure sensor (external pull-down)
+#define PRESSURE_GPIO GPIO_NUM_34
+
+// Tuned neutral pulse width to prevent creep
+#define SERVO_NEUTRAL 1495
 
 static bool alarm_active = false;
 static bool armed_state = false;
 static bool window_down = false; // false = up, true = down
+static bool seat_occupied = false;
 
 // --- Servo helpers (continuous rotation FS90R) ---
 static inline int us_to_duty(int us) {
-    // LEDC 13-bit resolution (0..8191), 20ms period (50 Hz)
-    return (us * 8191) / 20000;
+    return (us * 8191) / 20000; // 13-bit resolution, 20ms period
 }
 
 static inline void servo_set_us(int us) {
@@ -40,13 +43,14 @@ static inline void servo_set_us(int us) {
     ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1);
 }
 
-// --- ESP-NOW receive callback (ESP-IDF v5.x signature) ---
+// --- ESP-NOW receive callback ---
 void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     printf("Received: %.*s\n", len, data);
 
     int door1 = gpio_get_level(DOOR1_GPIO);
     int door2 = gpio_get_level(DOOR2_GPIO);
     int trunk = gpio_get_level(TRUNK_GPIO);
+    seat_occupied = gpio_get_level(PRESSURE_GPIO);   // ✅ read seat sensor
 
     if (strncmp((char*)data, "PANIC", len) == 0) {
         alarm_active = true;
@@ -55,17 +59,19 @@ void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     } else if (strncmp((char*)data, "DISARM", len) == 0) {
         alarm_active = false;
         armed_state = false;
-        gpio_set_level(LED_GPIO, 0);       // armed indicator off
-        gpio_set_level(BREAKIN_LED, 0);    // clear break-in latch
+        gpio_set_level(LED_GPIO, 0);
+        gpio_set_level(BREAKIN_LED, 0);
         ledc_set_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL, 0);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, BUZZER_CHANNEL);
         printf("System disarmed\n");
 
     } else if (strncmp((char*)data, "ARM", len) == 0) {
-        // Refuse to arm if any entry is open or window is down
-        if (door1 == 0 && door2 == 0 && trunk == 0 && !window_down) {
+
+        // ✅ Now includes seat_occupied check
+        if (door1 == 0 && door2 == 0 && trunk == 0 && !window_down && !seat_occupied) {
+
             armed_state = true;
-            gpio_set_level(LED_GPIO, 1);   // armed indicator on
+            gpio_set_level(LED_GPIO, 1);
             printf("System armed successfully\n");
 
             // One loud beep
@@ -78,7 +84,11 @@ void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
         } else {
             armed_state = false;
             gpio_set_level(LED_GPIO, 0);
-            if (window_down) {
+
+            // ✅ Correct failure reason
+            if (seat_occupied) {
+                printf("Arming failed — backseat occupied\n");
+            } else if (window_down) {
                 printf("Arming failed — window is down\n");
             } else {
                 printf("Arming failed — entry open\n");
@@ -99,13 +109,13 @@ void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
         if (!armed_state) {
             if (!window_down) {
                 printf("Rolling window down...\n");
-                servo_set_us(1400); // forward slow
+                servo_set_us(1400);
                 vTaskDelay(pdMS_TO_TICKS(2000));
                 servo_set_us(SERVO_NEUTRAL);
                 window_down = true;
             } else {
                 printf("Rolling window up...\n");
-                servo_set_us(1600); // reverse slow
+                servo_set_us(1600);
                 vTaskDelay(pdMS_TO_TICKS(2000));
                 servo_set_us(SERVO_NEUTRAL);
                 window_down = false;
@@ -124,7 +134,7 @@ void recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     }
 }
 
-// --- Sawtooth alarm task (runs while alarm_active is true) ---
+// --- Sawtooth alarm task ---
 void alarm_task(void *pvParameter) {
     while (1) {
         if (alarm_active) {
@@ -147,14 +157,13 @@ void alarm_task(void *pvParameter) {
     }
 }
 
-// --- Continuous monitoring task (armed only) ---
+// --- Continuous monitoring task (unchanged) ---
 void monitor_task(void *pvParameter) {
-    const TickType_t poll_ms = pdMS_TO_TICKS(50);     // poll rate
-    const int debounce_samples = 4;                   // ~200 ms debounce
+    const TickType_t poll_ms = pdMS_TO_TICKS(50);
+    const int debounce_samples = 4;
     int door1_hist = 0, door2_hist = 0, trunk_hist = 0, window_hist = 0;
 
     while (1) {
-        // Build simple shift-register history for debounce
         int d1 = gpio_get_level(DOOR1_GPIO);
         int d2 = gpio_get_level(DOOR2_GPIO);
         int tr = gpio_get_level(TRUNK_GPIO);
@@ -165,7 +174,6 @@ void monitor_task(void *pvParameter) {
         trunk_hist = ((trunk_hist << 1) | (tr & 1)) & ((1 << debounce_samples) - 1);
         window_hist = ((window_hist << 1) | (win & 1)) & ((1 << debounce_samples) - 1);
 
-        // Only react when armed and a signal is consistently "open"
         if (armed_state && !alarm_active) {
             bool door1_open = (door1_hist == ((1 << debounce_samples) - 1));
             bool door2_open = (door2_hist == ((1 << debounce_samples) - 1));
@@ -173,8 +181,8 @@ void monitor_task(void *pvParameter) {
             bool window_open = (window_hist == ((1 << debounce_samples) - 1));
 
             if (door1_open || door2_open || trunk_open || window_open) {
-                alarm_active = true;              // engage panic alarm
-                gpio_set_level(BREAKIN_LED, 1);   // latch break-in indicator
+                alarm_active = true;
+                gpio_set_level(BREAKIN_LED, 1);
                 printf("Unauthorized opening detected — alarm engaged\n");
             }
         }
@@ -193,17 +201,13 @@ void app_main(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    // Set custom MAC for receiver
     uint8_t custom_sta_mac[6] = {0x02, 0x00, 0x00, 0xAA, 0xBB, 0x02};
     esp_err_t err = esp_wifi_set_mac(WIFI_IF_STA, custom_sta_mac);
-    if (err != ESP_OK) {
-        printf("Failed to set MAC, error: %d\n", err);
-    }
+    if (err != ESP_OK) printf("Failed to set MAC, error: %d\n", err);
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // Init ESP-NOW
     ESP_ERROR_CHECK(esp_now_init());
     esp_now_register_recv_cb(recv_cb);
 
@@ -228,13 +232,13 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(ledc_channel_config(&channel_conf));
 
-    // Configure indicators
+    // Indicators
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, 0);         // not armed initially
+    gpio_set_level(LED_GPIO, 0);
     gpio_set_direction(BREAKIN_LED, GPIO_MODE_OUTPUT);
-    gpio_set_level(BREAKIN_LED, 0);      // no break-in latched
+    gpio_set_level(BREAKIN_LED, 0);
 
-    // Configure door/trunk buttons (floating because external pull-downs in your setup)
+    // Door/trunk inputs
     gpio_set_direction(DOOR1_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(DOOR1_GPIO, GPIO_FLOATING);
     gpio_set_direction(DOOR2_GPIO, GPIO_MODE_INPUT);
@@ -242,7 +246,11 @@ void app_main(void) {
     gpio_set_direction(TRUNK_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(TRUNK_GPIO, GPIO_FLOATING);
 
-    // Configure servo PWM (LEDC, 50 Hz)
+    // ✅ Backseat pressure sensor
+    gpio_set_direction(PRESSURE_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(PRESSURE_GPIO, GPIO_FLOATING);
+
+    // Servo PWM
     ledc_timer_config_t servo_timer = {
         .speed_mode       = LEDC_HIGH_SPEED_MODE,
         .duty_resolution  = LEDC_TIMER_13_BIT,
@@ -263,12 +271,10 @@ void app_main(void) {
     };
     ESP_ERROR_CHECK(ledc_channel_config(&servo_channel));
 
-    // Immediately drive servo to neutral (stop at tuned value)
     servo_set_us(SERVO_NEUTRAL);
 
-    // Start tasks
     xTaskCreate(alarm_task, "alarm_task", 2048, NULL, 5, NULL);
-    xTaskCreate(monitor_task, "monitor_task", 2048, NULL, 6, NULL); // slightly higher prio than alarm
+    xTaskCreate(monitor_task, "monitor_task", 2048, NULL, 6, NULL);
 
-    printf("Receiver ready. Monitoring armed state and entry points...\n");
+    printf("Receiver ready. Monitoring entry points and backseat sensor...\n");
 }
